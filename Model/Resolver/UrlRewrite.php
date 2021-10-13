@@ -7,18 +7,16 @@ declare(strict_types=1);
 
 namespace Magento\UrlRewriteGraphQl\Model\Resolver;
 
-use Magento\Framework\Exception\LocalizedException;
+use Magento\Framework\GraphQl\Exception\GraphQlInputException;
 use Magento\Framework\GraphQl\Schema\Type\ResolveInfo;
 use Magento\Framework\GraphQl\Config\Element\Field;
 use Magento\Framework\GraphQl\Query\ResolverInterface;
+use Magento\Store\Model\StoreManagerInterface;
 use Magento\UrlRewrite\Model\UrlFinderInterface;
-use Magento\UrlRewrite\Service\V1\Data\UrlRewrite as UrlRewriteDTO;
-use Magento\Framework\Model\AbstractModel;
-use Magento\Framework\EntityManager\TypeResolver;
-use Magento\Framework\EntityManager\MetadataPool;
+use Magento\UrlRewriteGraphQl\Model\Resolver\UrlRewrite\CustomUrlLocatorInterface;
 
 /**
- * Returns URL rewrites list for the specified product
+ * UrlRewrite field resolver, used for GraphQL request processing.
  */
 class UrlRewrite implements ResolverInterface
 {
@@ -28,36 +26,28 @@ class UrlRewrite implements ResolverInterface
     private $urlFinder;
 
     /**
-     * @var array
+     * @var StoreManagerInterface
      */
-    private $entityTypeMapping;
+    private $storeManager;
 
     /**
-     * @var MetadataPool
+     * @var CustomUrlLocatorInterface
      */
-    private $metadataPool;
-
-    /**
-     * @var TypeResolver
-     */
-    private $typeResolver;
+    private $customUrlLocator;
 
     /**
      * @param UrlFinderInterface $urlFinder
-     * @param TypeResolver $typeResolver
-     * @param MetadataPool $metadataPool
-     * @param array $entityTypeMapping
+     * @param StoreManagerInterface $storeManager
+     * @param CustomUrlLocatorInterface $customUrlLocator
      */
     public function __construct(
         UrlFinderInterface $urlFinder,
-        TypeResolver $typeResolver,
-        MetadataPool $metadataPool,
-        array $entityTypeMapping = []
+        StoreManagerInterface $storeManager,
+        CustomUrlLocatorInterface $customUrlLocator
     ) {
         $this->urlFinder = $urlFinder;
-        $this->typeResolver = $typeResolver;
-        $this->metadataPool = $metadataPool;
-        $this->entityTypeMapping = $entityTypeMapping;
+        $this->storeManager = $storeManager;
+        $this->customUrlLocator = $customUrlLocator;
     }
 
     /**
@@ -69,82 +59,90 @@ class UrlRewrite implements ResolverInterface
         ResolveInfo $info,
         array $value = null,
         array $args = null
-    ): array {
-        if (!isset($value['model'])) {
-            throw new LocalizedException(__('"model" value should be specified'));
+    ) {
+        if (!isset($args['url']) || empty(trim($args['url']))) {
+            throw new GraphQlInputException(__('"url" argument should be specified and not empty'));
         }
 
-        /** @var  AbstractModel $entity */
-        $entity = $value['model'];
-        $entityId = $entity->getEntityId();
-
-        $resolveEntityType = $this->typeResolver->resolve($entity);
-        $metadata = $this->metadataPool->getMetadata($resolveEntityType);
-        $entityType = $this->getEntityType($metadata->getEavEntityType());
-
-        $storeId = (int)$context->getExtensionAttributes()->getStore()->getId();
-
-        $data = [
-            UrlRewriteDTO::ENTITY_TYPE => $entityType,
-            UrlRewriteDTO::ENTITY_ID => $entityId,
-            UrlRewriteDTO::STORE_ID => $storeId
-        ];
-
-        $urlRewriteCollection = $this->urlFinder->findAllByData($data);
-
-        $urlRewrites = [];
-
-        /** @var UrlRewriteDTO $urlRewrite */
-        foreach ($urlRewriteCollection as $urlRewrite) {
-            if ($urlRewrite->getRedirectType() !== 0) {
-                continue;
-            }
-
-            $urlRewrites[] = [
-                'url' => $urlRewrite->getRequestPath(),
-                'parameters' => $this->getUrlParameters($urlRewrite->getTargetPath())
+        $result = null;
+        $url = $args['url'];
+        if (substr($url, 0, 1) === '/' && $url !== '/') {
+            $url = ltrim($url, '/');
+        }
+        $customUrl = $this->customUrlLocator->locateUrl($url);
+        $url = $customUrl ?: $url;
+        $urlRewrite = $this->findCanonicalUrl($url);
+        if ($urlRewrite) {
+            $result = [
+                'id' => $urlRewrite->getEntityId(),
+                'canonical_url' => $urlRewrite->getTargetPath(),
+                'type' => $this->sanitizeType($urlRewrite->getEntityType())
             ];
         }
-
-        return $urlRewrites;
+        return $result;
     }
 
     /**
-     * Parses target path and extracts parameters
+     * Find the canonical url passing through all redirects if any
+     *
+     * @param string $requestPath
+     * @return \Magento\UrlRewrite\Service\V1\Data\UrlRewrite|null
+     */
+    private function findCanonicalUrl(string $requestPath) : ?\Magento\UrlRewrite\Service\V1\Data\UrlRewrite
+    {
+        $urlRewrite = $this->findUrlFromRequestPath($requestPath);
+        if ($urlRewrite && $urlRewrite->getRedirectType() > 0) {
+            while ($urlRewrite && $urlRewrite->getRedirectType() > 0) {
+                $urlRewrite = $this->findUrlFromRequestPath($urlRewrite->getTargetPath());
+            }
+        }
+        if (!$urlRewrite) {
+            $urlRewrite = $this->findUrlFromTargetPath($requestPath);
+        }
+        
+        return $urlRewrite;
+    }
+
+    /**
+     * Find a url from a request url on the current store
+     *
+     * @param string $requestPath
+     * @return \Magento\UrlRewrite\Service\V1\Data\UrlRewrite|null
+     */
+    private function findUrlFromRequestPath(string $requestPath) : ?\Magento\UrlRewrite\Service\V1\Data\UrlRewrite
+    {
+        return $this->urlFinder->findOneByData(
+            [
+                'request_path' => $requestPath,
+                'store_id' => $this->storeManager->getStore()->getId()
+            ]
+        );
+    }
+
+    /**
+     * Find a url from a target url on the current store
      *
      * @param string $targetPath
-     * @return array
+     * @return \Magento\UrlRewrite\Service\V1\Data\UrlRewrite|null
      */
-    private function getUrlParameters(string $targetPath): array
+    private function findUrlFromTargetPath(string $targetPath) : ?\Magento\UrlRewrite\Service\V1\Data\UrlRewrite
     {
-        $urlParameters = [];
-        $targetPathParts = explode('/', trim($targetPath, '/'));
-        $count = count($targetPathParts) - 1;
-
-        /** $index starts from 3 to eliminate catalog/product/view/ part and fetch only name,
-         value data from from target path */
-        //phpcs:ignore Generic.CodeAnalysis.ForLoopWithTestFunctionCall
-        for ($index = 3; $index < $count; $index += 2) {
-            $urlParameters[] = [
-                'name' => $targetPathParts[$index],
-                'value' => $targetPathParts[$index + 1]
-            ];
-        }
-        return $urlParameters;
+        return $this->urlFinder->findOneByData(
+            [
+                'target_path' => $targetPath,
+                'store_id' => $this->storeManager->getStore()->getId()
+            ]
+        );
     }
 
     /**
-     * Get the entity type
+     * Sanitize the type to fit schema specifications
      *
-     * @param string $entityTypeMetadata
+     * @param string $type
      * @return string
      */
-    private function getEntityType(string $entityTypeMetadata) : string
+    private function sanitizeType(string $type) : string
     {
-        $entityType = '';
-        if ($entityTypeMetadata) {
-            $entityType = $this->entityTypeMapping[$entityTypeMetadata];
-        }
-        return $entityType;
+        return strtoupper(str_replace('-', '_', $type));
     }
 }
